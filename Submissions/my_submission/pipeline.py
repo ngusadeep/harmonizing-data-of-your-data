@@ -24,6 +24,8 @@ BASE_DIR = Path(__file__).resolve().parent
 REPO_ROOT = BASE_DIR.parent.parent
 ENV_FILE = BASE_DIR / ".env"
 MANUSCRIPT_MAX_CHARS = 120_000
+# Max chars for combined "all papers" user message in one request (saves sending baseline 15x)
+BATCH_MAX_USER_CHARS = 90_000
 PREDICTION_COLUMNS_EXCLUDE = ("ID", "PXD", "Raw Data File", "Usage")
 MANUSCRIPT_KEYS = ("TITLE", "ABSTRACT", "METHODS")
 
@@ -115,7 +117,7 @@ class PlaceholderExtractor:
 
 
 class OpenAIExtractor:
-    """Extract SDRF via OpenAI API."""
+    """Extract SDRF via OpenAI API. Supports one-call batch to send baseline prompt once."""
 
     def __init__(self, config: Config) -> None:
         self._config = config
@@ -146,13 +148,53 @@ class OpenAIExtractor:
         raw_response = (response.choices[0].message.content or "").strip()
         return self._parse_response(raw_response, raw_files)
 
+    def extract_batch(
+        self,
+        items: list[tuple[str, str, list[str]]],
+        prompt_spec: str,
+    ) -> dict[str, dict[str, dict]]:
+        """One request: system=baseline, user=all papers. Returns { PXD: { raw_file: { col: [vals] } } }."""
+        if not self._client or not self._config.openai_api_key or not items:
+            pxd_to_raws = {pxd: raws for pxd, _, raws in items}
+            return {pxd: {r: {} for r in raws} for pxd, raws in pxd_to_raws.items()}
+        n = max(1, len(items))
+        per_paper = min(MANUSCRIPT_MAX_CHARS, BATCH_MAX_USER_CHARS // n)
+        parts = []
+        pxd_to_raws: dict[str, list[str]] = {}
+        for pxd, manuscript_text, raw_files in items:
+            pxd_to_raws[pxd] = raw_files
+            text = (manuscript_text or "")[:per_paper]
+            parts.append(
+                f"=== {pxd} ===\nMANUSCRIPT_TEXT:\n{text}\n\nRAW_FILES:\n"
+                + "\n".join(raw_files)
+            )
+        batch_instruction = (
+            "Return ONE JSON object. Top-level keys are the PXD IDs above. "
+            "Each value is an object mapping each raw filename to SDRF column names and list values. "
+            'Example: {"PXD004010":{"file.raw":{"Characteristics[Organism]":["Homo sapiens"]}}}'
+        )
+        user_content = "\n\n".join(parts) + "\n\n" + batch_instruction
+        if len(user_content) > BATCH_MAX_USER_CHARS:
+            # Fallback: caller should use per-PXD extract(); return empty batch
+            return {pxd: {r: {} for r in raws} for pxd, raws in pxd_to_raws.items()}
+        response = self._client.chat.completions.create(
+            model=self._config.openai_model,
+            messages=[
+                {"role": "system", "content": prompt_spec},
+                {"role": "user", "content": user_content},
+            ],
+            temperature=0,
+        )
+        raw_response = (response.choices[0].message.content or "").strip()
+        return _parse_batch_json_response(raw_response, pxd_to_raws)
+
     @staticmethod
     def _parse_response(raw_response: str, raw_files: list[str]) -> dict[str, dict]:
         return _parse_llm_json_response(raw_response, raw_files)
 
 
 class OllamaExtractor:
-    """Extract SDRF via local Ollama API."""
+    """Extract SDRF via local Ollama API. Supports one-call batch to send baseline once."""
 
     def __init__(self, config: Config) -> None:
         self._config = config
@@ -187,11 +229,56 @@ class OllamaExtractor:
             return {raw: {} for raw in raw_files}
         return _parse_llm_json_response(raw_response, raw_files)
 
+    def extract_batch(
+        self,
+        items: list[tuple[str, str, list[str]]],
+        prompt_spec: str,
+    ) -> dict[str, dict[str, dict]]:
+        """One request: system=baseline, user=all papers. Returns { PXD: { raw_file: { col: [vals] } } }."""
+        if not items:
+            return {}
+        n = max(1, len(items))
+        per_paper = min(MANUSCRIPT_MAX_CHARS, BATCH_MAX_USER_CHARS // n)
+        parts = []
+        pxd_to_raws: dict[str, list[str]] = {}
+        for pxd, manuscript_text, raw_files in items:
+            pxd_to_raws[pxd] = raw_files
+            text = (manuscript_text or "")[:per_paper]
+            parts.append(
+                f"=== {pxd} ===\nMANUSCRIPT_TEXT:\n{text}\n\nRAW_FILES:\n"
+                + "\n".join(raw_files)
+            )
+        batch_instruction = (
+            "Return ONE JSON object. Top-level keys are the PXD IDs above. "
+            "Each value is an object mapping each raw filename to SDRF column names and list values. "
+            'Example: {"PXD004010":{"file.raw":{"Characteristics[Organism]":["Homo sapiens"]}}}'
+        )
+        user_content = "\n\n".join(parts) + "\n\n" + batch_instruction
+        if len(user_content) > BATCH_MAX_USER_CHARS:
+            return {pxd: {r: {} for r in raws} for pxd, raws in pxd_to_raws.items()}
+        payload = {
+            "model": self._config.ollama_model,
+            "messages": [
+                {"role": "system", "content": prompt_spec},
+                {"role": "user", "content": user_content},
+            ],
+            "stream": False,
+        }
+        try:
+            r = requests.post(
+                f"{self._config.ollama_base_url}/api/chat",
+                json=payload,
+                timeout=600,
+            )
+            r.raise_for_status()
+            raw_response = (r.json().get("message", {}).get("content") or "").strip()
+        except Exception:
+            return {pxd: {r: {} for r in raws} for pxd, raws in pxd_to_raws.items()}
+        return _parse_batch_json_response(raw_response, pxd_to_raws)
 
-def _parse_llm_json_response(
-    raw_response: str, raw_files: list[str]
-) -> dict[str, dict]:
-    """Parse JSON from LLM; strip markdown code block; normalize values to lists."""
+
+def _strip_json_from_response(raw_response: str) -> str:
+    """Strip markdown code block from LLM response; return inner JSON string."""
     text = raw_response
     if "```" in text:
         for p in text.split("```"):
@@ -199,8 +286,15 @@ def _parse_llm_json_response(
             if p.lower().startswith("json"):
                 p = p[4:].strip()
             if p.startswith("{"):
-                text = p
-                break
+                return p
+    return text
+
+
+def _parse_llm_json_response(
+    raw_response: str, raw_files: list[str]
+) -> dict[str, dict]:
+    """Parse JSON from LLM; strip markdown code block; normalize values to lists."""
+    text = _strip_json_from_response(raw_response)
     try:
         out = json.loads(text)
     except json.JSONDecodeError:
@@ -209,6 +303,29 @@ def _parse_llm_json_response(
         for k, v in list(out[raw].items()):
             if isinstance(v, str):
                 out[raw][k] = [v]
+    return out
+
+
+def _parse_batch_json_response(
+    raw_response: str,
+    pxd_to_raws: dict[str, list[str]],
+) -> dict[str, dict[str, dict]]:
+    """Parse batch JSON: { PXD: { raw_file: { col: [vals] } } }; normalize values to lists."""
+    text = _strip_json_from_response(raw_response)
+    try:
+        top = json.loads(text)
+    except json.JSONDecodeError:
+        return {pxd: {raw: {} for raw in raws} for pxd, raws in pxd_to_raws.items()}
+    out: dict[str, dict[str, dict]] = {}
+    for pxd, raws in pxd_to_raws.items():
+        out[pxd] = {}
+        inner = top.get(pxd) or {}
+        for raw in raws:
+            row = inner.get(raw) or {}
+            for k, v in list(row.items()):
+                if isinstance(v, str):
+                    row[k] = [v]
+            out[pxd][raw] = row
     return out
 
 
@@ -273,41 +390,83 @@ class SDRFPipeline:
                 f"Sample submission not found: {self._config.sample_submission_path}"
             )
 
+        print("[1/4] Loading template...")
         sub = pd.read_csv(self._config.sample_submission_path, index_col=0)
         template_columns = list(sub.columns)
         pred_columns = [
             c for c in template_columns if c not in PREDICTION_COLUMNS_EXCLUDE
         ]
-
-        print(f"Data dir: {self._config.data_dir}")
-        print(f"Mode: {self._config.mode_label(self._prompt_spec)}")
+        n_pxds = sub["PXD"].nunique()
+        print(f"      Data dir: {self._config.data_dir}")
+        print(f"      Mode: {self._config.mode_label(self._prompt_spec)}")
+        print(f"      Template: {len(sub)} rows, {n_pxds} PXDs")
 
         out_df = sub.copy()
+
+        print("[2/4] Loading PubText for each PXD...")
+        items: list[tuple[str, str, list[str]]] = []
         for pxd, group in sub.groupby("PXD"):
             raw_files = group["Raw Data File"].unique().tolist()
             doc = self._load_pubtext(pxd)
             if doc is None:
                 manuscript_text = ""
-                print(f"Warning: no PubText for {pxd}")
+                print(f"      Warning: no PubText for {pxd}")
             else:
                 manuscript_text = self._get_manuscript_text(doc)
                 if "Raw Data Files" in doc:
                     raw_files = doc["Raw Data Files"]
+            items.append((pxd, manuscript_text, raw_files))
+        print(f"      Loaded {len(items)} PXDs.")
 
-            sdrf_per_file = self._extractor.extract(
-                manuscript_text, raw_files, self._prompt_spec
-            )
-            for idx, r in group.iterrows():
-                row_vals = self._sdrf_to_row(
-                    r["Raw Data File"], sdrf_per_file, pred_columns
+        # One request for all (baseline sent once) when possible; else per-PXD
+        n = max(1, len(items))
+        per_paper = min(MANUSCRIPT_MAX_CHARS, BATCH_MAX_USER_CHARS // n)
+        batch_user_size = sum(
+            len((m or "")[:per_paper]) + 80 + sum(len(r) for r in raws)
+            for _, m, raws in items
+        )
+        use_batch = (
+            hasattr(self._extractor, "extract_batch")
+            and batch_user_size <= BATCH_MAX_USER_CHARS
+        )
+
+        if use_batch:
+            print("[3/4] Extracting (single batch request — baseline sent once)...")
+            batch_result = self._extractor.extract_batch(items, self._prompt_spec)
+            print("      Parsing response and filling rows...")
+            for pxd, group in sub.groupby("PXD"):
+                sdrf_per_file = batch_result.get(pxd, {})
+                for idx, r in group.iterrows():
+                    row_vals = self._sdrf_to_row(
+                        r["Raw Data File"], sdrf_per_file, pred_columns
+                    )
+                    for col in pred_columns:
+                        out_df.at[idx, col] = row_vals[col]
+            print("      Done.")
+        else:
+            print(f"[3/4] Extracting (per-PXD, {n_pxds} requests)...")
+            for i, ((pxd, manuscript_text, raw_files), (_, group)) in enumerate(
+                zip(items, sub.groupby("PXD")), start=1
+            ):
+                print(f"      [{i}/{n_pxds}] {pxd} ...", end=" ", flush=True)
+                sdrf_per_file = self._extractor.extract(
+                    manuscript_text, raw_files, self._prompt_spec
                 )
-                for col in pred_columns:
-                    out_df.at[idx, col] = row_vals[col]
+                for idx, r in group.iterrows():
+                    row_vals = self._sdrf_to_row(
+                        r["Raw Data File"], sdrf_per_file, pred_columns
+                    )
+                    for col in pred_columns:
+                        out_df.at[idx, col] = row_vals[col]
+                print("ok", flush=True)
+            print("      Done.")
 
+        print("[4/4] Writing submission...")
         out_df.to_csv(self._config.submission_output_path, index=True)
-        print(f"Wrote {self._config.submission_output_path} ({len(out_df)} rows)")
+        print(f"      Wrote {self._config.submission_output_path} ({len(out_df)} rows)")
 
         self._maybe_run_local_scoring(out_df)
+        print("Pipeline finished.")
         return self._config.submission_output_path
 
     def _maybe_run_local_scoring(self, out_df: pd.DataFrame) -> None:
