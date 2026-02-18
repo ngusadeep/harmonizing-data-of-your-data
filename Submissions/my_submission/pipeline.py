@@ -57,6 +57,8 @@ class Config:
             .strip()
             .rstrip("/")
         )
+        use_batch_raw = (os.environ.get("USE_BATCH") or "1").strip().lower()
+        self.use_batch = use_batch_raw not in ("0", "false", "no")
 
         for name in ("harmonizing-the-data-of-your-data", "data"):
             d = REPO_ROOT / name
@@ -99,6 +101,7 @@ class SDRFExtractor(Protocol):
         manuscript_text: str,
         raw_files: list[str],
         prompt_spec: str,
+        expected_columns: list[str] | None = None,
     ) -> dict[str, dict]:
         """Return mapping raw_filename -> { SDRF_column -> [values] }."""
         ...
@@ -112,6 +115,7 @@ class PlaceholderExtractor:
         manuscript_text: str,
         raw_files: list[str],
         prompt_spec: str,
+        expected_columns: list[str] | None = None,
     ) -> dict[str, dict]:
         return {raw: {} for raw in raw_files}
 
@@ -130,6 +134,7 @@ class OpenAIExtractor:
         manuscript_text: str,
         raw_files: list[str],
         prompt_spec: str,
+        expected_columns: list[str] | None = None,
     ) -> dict[str, dict]:
         if not self._client or not self._config.openai_api_key:
             return {raw: {} for raw in raw_files}
@@ -137,6 +142,8 @@ class OpenAIExtractor:
         user_content = f"MANUSCRIPT_TEXT:\n{text}\n\nRAW_FILES:\n" + "\n".join(
             raw_files
         )
+        if expected_columns:
+            user_content += "\n\nUse these exact column names as JSON keys when applicable: " + ", ".join(expected_columns)
         response = self._client.chat.completions.create(
             model=self._config.openai_model,
             messages=[
@@ -152,6 +159,7 @@ class OpenAIExtractor:
         self,
         items: list[tuple[str, str, list[str]]],
         prompt_spec: str,
+        expected_columns: list[str] | None = None,
     ) -> dict[str, dict[str, dict]]:
         """One request: system=baseline, user=all papers. Returns { PXD: { raw_file: { col: [vals] } } }."""
         if not self._client or not self._config.openai_api_key or not items:
@@ -173,6 +181,8 @@ class OpenAIExtractor:
             "Each value is an object mapping each raw filename to SDRF column names and list values. "
             'Example: {"PXD004010":{"file.raw":{"Characteristics[Organism]":["Homo sapiens"]}}}'
         )
+        if expected_columns:
+            batch_instruction += " Use these exact column names as keys when applicable: " + ", ".join(expected_columns)
         user_content = "\n\n".join(parts) + "\n\n" + batch_instruction
         if len(user_content) > BATCH_MAX_USER_CHARS:
             # Fallback: caller should use per-PXD extract(); return empty batch
@@ -204,11 +214,14 @@ class OllamaExtractor:
         manuscript_text: str,
         raw_files: list[str],
         prompt_spec: str,
+        expected_columns: list[str] | None = None,
     ) -> dict[str, dict]:
         text = manuscript_text[:MANUSCRIPT_MAX_CHARS]
         user_content = f"MANUSCRIPT_TEXT:\n{text}\n\nRAW_FILES:\n" + "\n".join(
             raw_files
         )
+        if expected_columns:
+            user_content += "\n\nUse these exact column names as JSON keys when applicable: " + ", ".join(expected_columns)
         payload = {
             "model": self._config.ollama_model,
             "messages": [
@@ -233,6 +246,7 @@ class OllamaExtractor:
         self,
         items: list[tuple[str, str, list[str]]],
         prompt_spec: str,
+        expected_columns: list[str] | None = None,
     ) -> dict[str, dict[str, dict]]:
         """One request: system=baseline, user=all papers. Returns { PXD: { raw_file: { col: [vals] } } }."""
         if not items:
@@ -253,6 +267,8 @@ class OllamaExtractor:
             "Each value is an object mapping each raw filename to SDRF column names and list values. "
             'Example: {"PXD004010":{"file.raw":{"Characteristics[Organism]":["Homo sapiens"]}}}'
         )
+        if expected_columns:
+            batch_instruction += " Use these exact column names as keys when applicable: " + ", ".join(expected_columns)
         user_content = "\n\n".join(parts) + "\n\n" + batch_instruction
         if len(user_content) > BATCH_MAX_USER_CHARS:
             return {pxd: {r: {} for r in raws} for pxd, raws in pxd_to_raws.items()}
@@ -426,13 +442,16 @@ class SDRFPipeline:
             for _, m, raws in items
         )
         use_batch = (
-            hasattr(self._extractor, "extract_batch")
+            self._config.use_batch
+            and hasattr(self._extractor, "extract_batch")
             and batch_user_size <= BATCH_MAX_USER_CHARS
         )
 
         if use_batch:
             print("[3/4] Extracting (single batch request — baseline sent once)...")
-            batch_result = self._extractor.extract_batch(items, self._prompt_spec)
+            batch_result = self._extractor.extract_batch(
+                items, self._prompt_spec, expected_columns=pred_columns
+            )
             print("      Parsing response and filling rows...")
             for pxd, group in sub.groupby("PXD"):
                 sdrf_per_file = batch_result.get(pxd, {})
@@ -450,7 +469,10 @@ class SDRFPipeline:
             ):
                 print(f"      [{i}/{n_pxds}] {pxd} ...", end=" ", flush=True)
                 sdrf_per_file = self._extractor.extract(
-                    manuscript_text, raw_files, self._prompt_spec
+                    manuscript_text,
+                    raw_files,
+                    self._prompt_spec,
+                    expected_columns=pred_columns,
                 )
                 for idx, r in group.iterrows():
                     row_vals = self._sdrf_to_row(
