@@ -1,99 +1,210 @@
 """
-SDRF extraction pipeline for Harmonizing the Data of your Data.
-Loads test papers, extracts metadata (placeholder or LLM), generates submission.csv.
-Put OPENAI_API_KEY in .env (or set env var) to use GPT extraction.
+SDRF extraction pipeline — Harmonizing the Data of your Data.
+Loads test papers, extracts metadata via placeholder, OpenAI, or Ollama; writes submission.csv.
+Configure in .env: LLM_PROVIDER (openai | ollama | empty), model names, API key.
 """
-from pathlib import Path
+
+from __future__ import annotations
+
 import json
 import os
+import sys
+from pathlib import Path
+from typing import Protocol
+
 import pandas as pd
+import requests
+from dotenv import load_dotenv
+from openai import OpenAI
 
-# Load .env from this folder so OPENAI_API_KEY is available
-_env = Path(__file__).resolve().parent / ".env"
-if _env.exists():
-    try:
-        from dotenv import load_dotenv
-        load_dotenv(_env)
-    except ImportError:
-        pass
+# -----------------------------------------------------------------------------
+# Constants
+# -----------------------------------------------------------------------------
+BASE_DIR = Path(__file__).resolve().parent
+REPO_ROOT = BASE_DIR.parent.parent
+ENV_FILE = BASE_DIR / ".env"
+MANUSCRIPT_MAX_CHARS = 120_000
+PREDICTION_COLUMNS_EXCLUDE = ("ID", "PXD", "Raw Data File", "Usage")
+MANUSCRIPT_KEYS = ("TITLE", "ABSTRACT", "METHODS")
 
-# Paths: run from Submissions/my_submission/; data can be repo_root/harmonizing-the-data-of-your-data or repo_root/data
-BASE = Path(__file__).resolve().parent
-REPO_ROOT = BASE.parent.parent
-for data_name in ("harmonizing-the-data-of-your-data", "data"):
-    _data = REPO_ROOT / data_name
-    if _data.exists():
-        DATA_DIR = _data
-        break
-else:
-    DATA_DIR = REPO_ROOT / "harmonizing-the-data-of-your-data"
+if ENV_FILE.exists():
+    load_dotenv(ENV_FILE)
 
-SAMPLE_SUBMISSION = DATA_DIR / "SampleSubmission.csv"
-TEST_PUBTEXT = DATA_DIR / "Test PubText" / "Test PubText"
-if not TEST_PUBTEXT.exists():
-    TEST_PUBTEXT = DATA_DIR / "Test_PubText" / "Test PubText"
-BASELINE_PROMPT = DATA_DIR / "BaselinePrompt.txt"
+# Optional: local scoring (repo must have src.Scoring)
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+try:
+    from src.Scoring import score as score_submission
+except ImportError:
+    score_submission = None
 
 
-def load_pubtext(pxd: str) -> dict | None:
-    """Load publication text JSON for a PXD. Returns None if not found."""
-    path = TEST_PUBTEXT / f"{pxd}_PubText.json"
-    if not path.exists():
-        return None
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
+# -----------------------------------------------------------------------------
+# Config
+# -----------------------------------------------------------------------------
+class Config:
+    """Environment-derived configuration. .env is loaded at module load."""
+
+    def __init__(self) -> None:
+        self.llm_provider = (os.environ.get("LLM_PROVIDER") or "").strip().lower()
+        self.openai_api_key = (os.environ.get("OPENAI_API_KEY") or "").strip()
+        self.openai_model = os.environ.get("OPENAI_MODEL", "gpt-4o-mini").strip()
+        self.ollama_model = os.environ.get("OLLAMA_MODEL", "llama3.2").strip()
+        self.ollama_base_url = (
+            os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
+            .strip()
+            .rstrip("/")
+        )
+
+        for name in ("harmonizing-the-data-of-your-data", "data"):
+            d = REPO_ROOT / name
+            if d.exists():
+                self.data_dir = d
+                break
+        else:
+            self.data_dir = REPO_ROOT / "harmonizing-the-data-of-your-data"
+
+        self.sample_submission_path = self.data_dir / "SampleSubmission.csv"
+        self.test_pubtext_dir = self.data_dir / "Test PubText" / "Test PubText"
+        if not self.test_pubtext_dir.exists():
+            self.test_pubtext_dir = self.data_dir / "Test_PubText" / "Test_PubText"
+        self.baseline_prompt_path = self.data_dir / "BaselinePrompt.txt"
+        self.submission_output_path = BASE_DIR / "submission.csv"
+
+    @property
+    def effective_provider(self) -> str:
+        """Provider to use (empty if no prompt file)."""
+        return self.llm_provider
+
+    def mode_label(self, prompt_spec: str) -> str:
+        """Human-readable mode for logging."""
+        provider = self.effective_provider if prompt_spec else ""
+        if provider == "openai":
+            return f"OpenAI ({self.openai_model})"
+        if provider == "ollama":
+            return f"Ollama ({self.ollama_model})"
+        return "placeholder"
 
 
-def get_manuscript_text(doc: dict) -> str:
-    """Extract in-scope text: Title, Abstract, Methods (per BaselinePrompt)."""
-    parts = []
-    for key in ("TITLE", "ABSTRACT", "METHODS"):
-        if key in doc and doc[key]:
-            parts.append(doc[key].strip())
-    return "\n\n".join(parts)
+# -----------------------------------------------------------------------------
+# Extractors (Strategy pattern)
+# -----------------------------------------------------------------------------
+class SDRFExtractor(Protocol):
+    """Protocol for SDRF extraction: manuscript + raw files -> per-file metadata."""
+
+    def extract(
+        self,
+        manuscript_text: str,
+        raw_files: list[str],
+        prompt_spec: str,
+    ) -> dict[str, dict]:
+        """Return mapping raw_filename -> { SDRF_column -> [values] }."""
+        ...
 
 
-def extract_sdrf(manuscript_text: str, raw_files: list[str], use_llm: bool, prompt_spec: str) -> dict:
-    """
-    Extract SDRF metadata per raw file.
-    Returns dict: raw_filename -> { SDRF_column: [value1, ...] }
-    """
-    if use_llm and prompt_spec:
-        return _extract_with_llm(manuscript_text, raw_files, prompt_spec)
-    return _extract_placeholder(raw_files)
+class PlaceholderExtractor:
+    """No LLM; every cell becomes Not Applicable."""
+
+    def extract(
+        self,
+        manuscript_text: str,
+        raw_files: list[str],
+        prompt_spec: str,
+    ) -> dict[str, dict]:
+        return {raw: {} for raw in raw_files}
 
 
-def _extract_placeholder(raw_files: list[str]) -> dict:
-    """Placeholder: "Not Applicable" for every cell. Replace with real extraction for better score."""
-    return {raw: {} for raw in raw_files}
+class OpenAIExtractor:
+    """Extract SDRF via OpenAI API."""
+
+    def __init__(self, config: Config) -> None:
+        self._config = config
+        self._client: OpenAI | None = (
+            OpenAI(api_key=config.openai_api_key) if config.openai_api_key else None
+        )
+
+    def extract(
+        self,
+        manuscript_text: str,
+        raw_files: list[str],
+        prompt_spec: str,
+    ) -> dict[str, dict]:
+        if not self._client or not self._config.openai_api_key:
+            return {raw: {} for raw in raw_files}
+        text = manuscript_text[:MANUSCRIPT_MAX_CHARS]
+        user_content = f"MANUSCRIPT_TEXT:\n{text}\n\nRAW_FILES:\n" + "\n".join(
+            raw_files
+        )
+        response = self._client.chat.completions.create(
+            model=self._config.openai_model,
+            messages=[
+                {"role": "system", "content": prompt_spec},
+                {"role": "user", "content": user_content},
+            ],
+            temperature=0,
+        )
+        raw_response = (response.choices[0].message.content or "").strip()
+        return self._parse_response(raw_response, raw_files)
+
+    @staticmethod
+    def _parse_response(raw_response: str, raw_files: list[str]) -> dict[str, dict]:
+        return _parse_llm_json_response(raw_response, raw_files)
 
 
-def _extract_with_llm(manuscript_text: str, raw_files: list[str], prompt_spec: str) -> dict:
-    """Call OpenAI API to extract SDRF per raw file."""
-    try:
-        import openai
-    except ImportError:
-        return _extract_placeholder(raw_files)
-    client = openai.OpenAI()
-    raw_list = "\n".join(raw_files)
-    user_content = f"MANUSCRIPT_TEXT:\n{manuscript_text[:120000]}\n\nRAW_FILES:\n{raw_list}"
-    response = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[
-            {"role": "system", "content": prompt_spec},
-            {"role": "user", "content": user_content},
-        ],
-        temperature=0,
-    )
-    text = response.choices[0].message.content.strip()
+class OllamaExtractor:
+    """Extract SDRF via local Ollama API."""
+
+    def __init__(self, config: Config) -> None:
+        self._config = config
+
+    def extract(
+        self,
+        manuscript_text: str,
+        raw_files: list[str],
+        prompt_spec: str,
+    ) -> dict[str, dict]:
+        text = manuscript_text[:MANUSCRIPT_MAX_CHARS]
+        user_content = f"MANUSCRIPT_TEXT:\n{text}\n\nRAW_FILES:\n" + "\n".join(
+            raw_files
+        )
+        payload = {
+            "model": self._config.ollama_model,
+            "messages": [
+                {"role": "system", "content": prompt_spec},
+                {"role": "user", "content": user_content},
+            ],
+            "stream": False,
+        }
+        try:
+            r = requests.post(
+                f"{self._config.ollama_base_url}/api/chat",
+                json=payload,
+                timeout=300,
+            )
+            r.raise_for_status()
+            raw_response = (r.json().get("message", {}).get("content") or "").strip()
+        except Exception:
+            return {raw: {} for raw in raw_files}
+        return _parse_llm_json_response(raw_response, raw_files)
+
+
+def _parse_llm_json_response(
+    raw_response: str, raw_files: list[str]
+) -> dict[str, dict]:
+    """Parse JSON from LLM; strip markdown code block; normalize values to lists."""
+    text = raw_response
     if "```" in text:
-        text = text.split("```")[1]
-        if text.startswith("json"):
-            text = text[4:]
+        for p in text.split("```"):
+            p = p.strip()
+            if p.lower().startswith("json"):
+                p = p[4:].strip()
+            if p.startswith("{"):
+                text = p
+                break
     try:
         out = json.loads(text)
     except json.JSONDecodeError:
-        return _extract_placeholder(raw_files)
+        return {raw: {} for raw in raw_files}
     for raw in out:
         for k, v in list(out[raw].items()):
             if isinstance(v, str):
@@ -101,72 +212,130 @@ def _extract_with_llm(manuscript_text: str, raw_files: list[str], prompt_spec: s
     return out
 
 
-def _sdrf_to_row(raw_file: str, sdrf_dict: dict, pred_columns: list) -> dict:
-    """Build prediction column -> value for one raw file."""
-    file_meta = sdrf_dict.get(raw_file, {})
-    row = {}
-    for col in pred_columns:
-        vals = file_meta.get(col)
-        if vals and len(vals) > 0:
-            row[col] = vals[0] if isinstance(vals, list) else str(vals)
-        else:
-            row[col] = "Not Applicable"
-    return row
+def get_extractor(config: Config, prompt_spec: str) -> SDRFExtractor:
+    """Factory: return the extractor for the configured provider."""
+    provider = config.effective_provider if prompt_spec else ""
+    if provider == "openai":
+        return OpenAIExtractor(config)
+    if provider == "ollama":
+        return OllamaExtractor(config)
+    return PlaceholderExtractor()
 
 
-def main():
-    use_llm = bool(os.environ.get("OPENAI_API_KEY"))
-    print(f"Data dir: {DATA_DIR}")
-    print(f"Using {'LLM extraction' if use_llm else 'placeholder (Not Applicable)'}")
+# -----------------------------------------------------------------------------
+# Pipeline
+# -----------------------------------------------------------------------------
+class SDRFPipeline:
+    """Orchestrates loading data, running extractor, and writing submission.csv."""
 
-    if not SAMPLE_SUBMISSION.exists():
-        raise FileNotFoundError(f"Sample submission not found: {SAMPLE_SUBMISSION}")
-    sub = pd.read_csv(SAMPLE_SUBMISSION, index_col=0)
-    template_columns = list(sub.columns)
-    pred_columns = [c for c in template_columns if c not in ("ID", "PXD", "Raw Data File", "Usage")]
+    def __init__(self, config: Config) -> None:
+        self._config = config
+        self._prompt_spec = self._load_baseline_prompt()
+        self._extractor = get_extractor(config, self._prompt_spec)
 
-    prompt_spec = ""
-    if BASELINE_PROMPT.exists():
-        prompt_spec = BASELINE_PROMPT.read_text(encoding="utf-8")
+    def _load_baseline_prompt(self) -> str:
+        if self._config.baseline_prompt_path.exists():
+            return self._config.baseline_prompt_path.read_text(encoding="utf-8")
+        return ""
 
-    out_df = sub.copy()
-    for pxd, group in sub.groupby("PXD"):
-        raw_files = group["Raw Data File"].unique().tolist()
-        doc = load_pubtext(pxd)
-        if doc is None:
-            manuscript_text = ""
-            print(f"Warning: no PubText for {pxd}")
-        else:
-            manuscript_text = get_manuscript_text(doc)
-            if "Raw Data Files" in doc:
-                raw_files = doc["Raw Data Files"]
+    def _load_pubtext(self, pxd: str) -> dict | None:
+        path = self._config.test_pubtext_dir / f"{pxd}_PubText.json"
+        if not path.exists():
+            return None
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
 
-        sdrf_per_file = extract_sdrf(manuscript_text, raw_files, use_llm, prompt_spec)
-        for idx, r in group.iterrows():
-            filled = _sdrf_to_row(r["Raw Data File"], sdrf_per_file, pred_columns)
-            for col in pred_columns:
-                out_df.at[idx, col] = filled[col]
+    @staticmethod
+    def _get_manuscript_text(doc: dict) -> str:
+        parts = [doc[k].strip() for k in MANUSCRIPT_KEYS if doc.get(k)]
+        return "\n\n".join(parts)
 
-    out_path = BASE / "submission.csv"
-    out_df.to_csv(out_path, index=True)
-    print(f"Wrote {out_path} ({len(out_df)} rows)")
+    @staticmethod
+    def _sdrf_to_row(
+        raw_file: str,
+        sdrf_per_file: dict[str, dict],
+        pred_columns: list[str],
+    ) -> dict[str, str]:
+        meta = sdrf_per_file.get(raw_file, {})
+        row = {}
+        for col in pred_columns:
+            vals = meta.get(col)
+            if vals and len(vals) > 0:
+                row[col] = vals[0] if isinstance(vals, list) else str(vals)
+            else:
+                row[col] = "Not Applicable"
+        return row
 
-    # Optional: score locally if src.Scoring is available
-    try:
-        import sys
-        src_path = REPO_ROOT / "src"
-        if src_path.exists() and str(REPO_ROOT) not in sys.path:
-            sys.path.insert(0, str(REPO_ROOT))
-        from src.Scoring import score
-        solution_path = DATA_DIR / "Training_SDRFs" / "HarmonizedFiles" / "training.csv"
-        if solution_path.exists():
-            solution_df = pd.read_csv(solution_path, index_col=0)
-            eval_df, f1 = score(solution_df, out_df, "ID")
-            print(f"Local F1 Score (vs training): {f1:.6f}")
-    except Exception as e:
-        print(f"(Optional scoring skipped: {e})")
+    def run(self) -> Path:
+        """Load template, extract per PXD, fill submission, write CSV. Returns output path."""
+        if not self._config.sample_submission_path.exists():
+            raise FileNotFoundError(
+                f"Sample submission not found: {self._config.sample_submission_path}"
+            )
 
-    return out_path
+        sub = pd.read_csv(self._config.sample_submission_path, index_col=0)
+        template_columns = list(sub.columns)
+        pred_columns = [
+            c for c in template_columns if c not in PREDICTION_COLUMNS_EXCLUDE
+        ]
+
+        print(f"Data dir: {self._config.data_dir}")
+        print(f"Mode: {self._config.mode_label(self._prompt_spec)}")
+
+        out_df = sub.copy()
+        for pxd, group in sub.groupby("PXD"):
+            raw_files = group["Raw Data File"].unique().tolist()
+            doc = self._load_pubtext(pxd)
+            if doc is None:
+                manuscript_text = ""
+                print(f"Warning: no PubText for {pxd}")
+            else:
+                manuscript_text = self._get_manuscript_text(doc)
+                if "Raw Data Files" in doc:
+                    raw_files = doc["Raw Data Files"]
+
+            sdrf_per_file = self._extractor.extract(
+                manuscript_text, raw_files, self._prompt_spec
+            )
+            for idx, r in group.iterrows():
+                row_vals = self._sdrf_to_row(
+                    r["Raw Data File"], sdrf_per_file, pred_columns
+                )
+                for col in pred_columns:
+                    out_df.at[idx, col] = row_vals[col]
+
+        out_df.to_csv(self._config.submission_output_path, index=True)
+        print(f"Wrote {self._config.submission_output_path} ({len(out_df)} rows)")
+
+        self._maybe_run_local_scoring(out_df)
+        return self._config.submission_output_path
+
+    def _maybe_run_local_scoring(self, out_df: pd.DataFrame) -> None:
+        """If src.Scoring exists in repo, compute and print local F1."""
+        if score_submission is None:
+            return
+        try:
+            solution_path = (
+                self._config.data_dir
+                / "Training_SDRFs"
+                / "HarmonizedFiles"
+                / "training.csv"
+            )
+            if solution_path.exists():
+                solution_df = pd.read_csv(solution_path, index_col=0)
+                _, f1 = score_submission(solution_df, out_df, "ID")
+                print(f"Local F1 (vs training): {f1:.6f}")
+        except Exception as e:
+            print(f"(Optional scoring skipped: {e})")
+
+
+# -----------------------------------------------------------------------------
+# Entry point
+# -----------------------------------------------------------------------------
+def main() -> Path:
+    config = Config()
+    pipeline = SDRFPipeline(config)
+    return pipeline.run()
 
 
 if __name__ == "__main__":
